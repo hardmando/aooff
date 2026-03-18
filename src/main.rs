@@ -8,14 +8,14 @@ use std::time::Duration;
 fn main() {
     let home = std::env::var("HOME").expect("Failed to get HOME directory");
 
-    // Start daemon (now returns BOTH projects and apps)
+    // Start daemon (returns both projects and apps)
     let (projects, apps) = daemon::start_daemon(home);
 
     // Temporary debug loop (replace later with UI event loop)
     loop {
         {
-            let pr = projects.read().unwrap();
-            let ap = apps.read().unwrap();
+            let pr = projects.load();
+            let ap = apps.load();
 
             println!("==== CURRENT STATE ====");
 
@@ -28,7 +28,7 @@ fn main() {
             for a in ap.iter() {
                 println!("  {}", a.name);
             }
-        } // locks released here immediately
+        }
 
         thread::sleep(Duration::from_secs(10));
     }

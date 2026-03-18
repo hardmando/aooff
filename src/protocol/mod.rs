@@ -1,18 +1,21 @@
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Archive, Serialize, Deserialize, Debug)]
+#[rkyv(derive(Debug))]
 pub enum Request {
     GetProjects,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Archive, Serialize, Deserialize, Debug)]
+#[rkyv(derive(Debug))]
 pub enum Response {
-    Projects(Vec<ProjectDto>),
+    Projects(Vec<Project>),
     Error(String),
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ProjectDto {
-    pub name: String,
-    pub path: String,
+#[derive(Archive, Serialize, Deserialize, Debug, Clone)]
+#[rkyv(derive(Debug))]
+pub struct Project {
+    pub name: Box<str>,
+    pub path: Box<str>,
 }
