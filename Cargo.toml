@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+arc-swap = "1.8.2"
+rkyv = "0.8.15"
+tokio = "1.50.0"
+walkdir = "2.5.0"
+winit = "0.30.13"
+
