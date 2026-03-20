@@ -1,5 +1,6 @@
 pub mod daemon;
 pub mod popup;
+pub mod protocol;
 
 use std::thread;
 use std::time::Duration;
