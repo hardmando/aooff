@@ -1,7 +1,7 @@
 mod ipc;
 mod scanner;
 
-use crate::protocol::Project;
+use aooff::protocol::{App, Project};
 use arc_swap::ArcSwap;
 use notify::{EventKind, RecursiveMode, Watcher};
 use std::os::unix::net::UnixListener;
@@ -16,7 +16,7 @@ pub fn start_daemon(
     home: String,
 ) -> (
     Arc<ArcSwap<Vec<Project>>>,
-     Arc<ArcSwap<Vec<scanner::App>>>,
+    Arc<ArcSwap<Vec<App>>>,
 ) {
     let projects = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let apps = Arc::new(ArcSwap::from_pointee(Vec::new()));
@@ -26,6 +26,9 @@ pub fn start_daemon(
     // Initial scan
     do_scan_projects(&projects, &projects_dir);
     do_scan_apps(&apps);
+
+    // Start IPC server
+    start_ipc_server(Arc::clone(&projects), Arc::clone(&apps));
 
     // Watcher thread
     {
@@ -62,9 +65,10 @@ pub fn start_daemon(
                 match event {
                     Ok(event) => match event.kind {
                         EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(_) => {
-                            let is_project_event = event.paths.iter().any(|p| {
-                                p.starts_with(&projects_dir_clone)
-                            });
+                            let is_project_event = event
+                                .paths
+                                .iter()
+                                .any(|p| p.starts_with(&projects_dir_clone));
 
                             if is_project_event {
                                 do_scan_projects(&projects_clone, &projects_dir_clone);
@@ -91,7 +95,7 @@ fn do_scan_projects(store: &Arc<ArcSwap<Vec<Project>>>, projects_dir: &str) {
     store.store(Arc::new(new_projects));
 }
 
-fn do_scan_apps(store: &Arc<ArcSwap<Vec<scanner::App>>>) {
+fn do_scan_apps(store: &Arc<ArcSwap<Vec<App>>>) {
     let mut new_apps = Vec::with_capacity(ESTIMATED_APPS);
     if let Err(err) = scanner::scan_apps(&mut new_apps) {
         eprintln!("App scan error: {}", err);
@@ -99,22 +103,31 @@ fn do_scan_apps(store: &Arc<ArcSwap<Vec<scanner::App>>>) {
     store.store(Arc::new(new_apps));
 }
 
-fn start_ipc_server(projects: Arc<ArcSwap<Vec<Project>>>) {
-    let socket_path = "/tmp/mydaemon.sock";
+fn start_ipc_server(
+    projects: Arc<ArcSwap<Vec<Project>>>,
+    apps: Arc<ArcSwap<Vec<App>>>,
+) {
+    let socket_path = "/tmp/aooff.sock";
 
     let _ = std::fs::remove_file(socket_path);
 
-    // TODO: Fix unwrap - handle errors
-    let listener = UnixListener::bind(socket_path).unwrap();
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("Failed to bind IPC socket: {}", e);
+            return;
+        }
+    };
 
-    std::thread::spawn(move || {
+    thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
                     let projects = Arc::clone(&projects);
+                    let apps = Arc::clone(&apps);
 
-                    std::thread::spawn(move || {
-                        ipc::handle_client(&mut stream, projects);
+                    thread::spawn(move || {
+                        ipc::handle_client(&mut stream, projects, apps);
                     });
                 }
                 Err(e) => eprintln!("IPC error: {}", e),

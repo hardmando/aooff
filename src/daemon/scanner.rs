@@ -1,9 +1,4 @@
-use crate::protocol::Project;
-
-pub struct App {
-    pub name: Box<str>,
-    pub path: Box<str>,
-}
+use aooff::protocol::{App, Project};
 
 pub fn scan_projects(projects: &mut Vec<Project>, projects_dir: &str) -> Result<(), String> {
     use std::path::Path;
@@ -13,12 +8,12 @@ pub fn scan_projects(projects: &mut Vec<Project>, projects_dir: &str) -> Result<
         return Err("Projects directory not found".into());
     }
 
-    for entry in WalkDir::new(&projects_dir).max_depth(1) {
+    for entry in WalkDir::new(projects_dir).max_depth(1) {
         match entry {
             Ok(entry) => {
                 let path = entry.path();
 
-                if path == Path::new(&projects_dir) {
+                if path == Path::new(projects_dir) {
                     continue;
                 }
 
@@ -26,7 +21,7 @@ pub fn scan_projects(projects: &mut Vec<Project>, projects_dir: &str) -> Result<
                     let path_str = path.to_string_lossy().to_string();
 
                     let name: Box<str> = path_str
-                        .strip_prefix(&projects_dir)
+                        .strip_prefix(projects_dir)
                         .unwrap_or(&path_str)
                         .into();
 

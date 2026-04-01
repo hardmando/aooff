@@ -3,6 +3,14 @@ name = "aooff"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "aooff"
+path = "src/main.rs"
+
+[[bin]]
+name = "aooff-popup"
+path = "src/bin/popup.rs"
+
 [dependencies]
 arc-swap = "1.8.2"
 crossterm = "0.29.0"
@@ -14,4 +22,3 @@ tokio = "1.50.0"
 notify = "8.0"
 walkdir = "2.5.0"
 winit = "0.30.13"
-

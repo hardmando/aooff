@@ -5,9 +5,13 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use rkyv::util::AlignedVec;
 
-use crate::protocol::{Project, Request, Response};
+use aooff::protocol::{App, Project, Request, Response};
 
-pub fn handle_client(stream: &mut UnixStream, projects: Arc<ArcSwap<Vec<Project>>>) {
+pub fn handle_client(
+    stream: &mut UnixStream,
+    projects: Arc<ArcSwap<Vec<Project>>>,
+    apps: Arc<ArcSwap<Vec<App>>>,
+) {
     let mut buffer = Vec::new();
 
     if let Err(e) = stream.read_to_end(&mut buffer) {
@@ -31,6 +35,14 @@ pub fn handle_client(stream: &mut UnixStream, projects: Arc<ArcSwap<Vec<Project>
         Request::GetProjects => {
             let guard = projects.load();
             Response::Projects(guard.to_vec())
+        }
+        Request::GetAll => {
+            let pr = projects.load();
+            let ap = apps.load();
+            Response::All {
+                projects: pr.to_vec(),
+                apps: ap.to_vec(),
+            }
         }
     };
 
