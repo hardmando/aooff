@@ -1,16 +1,8 @@
-use crate::protocol;
-
-#[derive(Debug)]
-pub struct Project {
-    id: u8,
-    pub name: String,
-    path: String,
-}
+use crate::protocol::Project;
 
 pub struct App {
-    id: u8,
-    pub name: String,
-    path: String,
+    pub name: Box<str>,
+    pub path: Box<str>,
 }
 
 pub fn scan_projects(projects: &mut Vec<Project>, home: &str) -> Result<(), String> {
@@ -35,13 +27,14 @@ pub fn scan_projects(projects: &mut Vec<Project>, home: &str) -> Result<(), Stri
                 if path.is_dir() {
                     let path_str = path.to_string_lossy().to_string();
 
+                    let name: Box<str> = path_str
+                        .strip_prefix(&projects_dir)
+                        .unwrap_or(&path_str)
+                        .into();
+
                     projects.push(Project {
-                        id: projects.len() as u8,
-                        name: path_str
-                            .strip_prefix(&projects_dir)
-                            .unwrap_or(&path_str)
-                            .to_string(),
-                        path: path_str,
+                        name,
+                        path: path_str.into_boxed_str(),
                     });
                 }
             }
@@ -64,12 +57,14 @@ pub fn scan_apps(apps: &mut Vec<App>) -> Result<(), String> {
                     let path = entry.path();
 
                     if path.is_file() {
-                        let name = path.file_name().unwrap().to_string_lossy().to_string();
-
                         apps.push(App {
-                            id: apps.len() as u8,
-                            name,
-                            path: path.to_string_lossy().to_string(),
+                            name: path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .into_owned()
+                                .into_boxed_str(),
+                            path: path.to_string_lossy().into_owned().into_boxed_str(),
                         });
                     }
                 }
