@@ -5,13 +5,11 @@ pub struct App {
     pub path: Box<str>,
 }
 
-pub fn scan_projects(projects: &mut Vec<Project>, home: &str) -> Result<(), String> {
+pub fn scan_projects(projects: &mut Vec<Project>, projects_dir: &str) -> Result<(), String> {
     use std::path::Path;
     use walkdir::WalkDir;
 
-    let projects_dir = format!("{}/projects/", home);
-
-    if !Path::new(&projects_dir).exists() {
+    if !Path::new(projects_dir).exists() {
         return Err("Projects directory not found".into());
     }
 
