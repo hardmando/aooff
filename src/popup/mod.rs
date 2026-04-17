@@ -42,6 +42,7 @@ impl SuggestionItem {
     }
 
     pub fn execute(&self) {
+        let config = crate::config::Config::load();
         match self {
             SuggestionItem::App(a) => {
                 let _ = Command::new(&*a.path).spawn();
@@ -51,7 +52,7 @@ impl SuggestionItem {
                 let _ = Command::new("sh")
                     .arg("-c")
                     .arg(format!(
-                        "kitty -e tmux new-session sh -c \"cd '{}' && tdl c\"",
+                        "{} -e tmux new-session sh -c \"cd '{}' && tdl c\"", config.terminal,
                         path
                     ))
                     .spawn();
@@ -60,7 +61,7 @@ impl SuggestionItem {
                 let _ = Command::new("xdg-open").arg(f).spawn();
             }
             SuggestionItem::Directory(d) => {
-                let _ = Command::new("kitty")
+                let _ = Command::new("alacritty")
                     .arg("--working-directory")
                     .arg(d)
                     .spawn();
@@ -428,7 +429,7 @@ fn draw(
         width,
         height,
         15,
-        -12,
+        0,
         &search_title,
         font_system,
         swash_cache,

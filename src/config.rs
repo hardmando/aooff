@@ -32,6 +32,8 @@ pub struct Config {
     pub app_tag_color: u32,
     #[serde(default = "default_project_tag_color")]
     pub project_tag_color: u32,
+    #[serde(default = "default_terminal")]
+    pub terminal: String,
 }
 
 fn default_window_width() -> u32 {
@@ -76,6 +78,9 @@ fn default_app_tag_color() -> u32 {
 fn default_project_tag_color() -> u32 {
     0xFFC6A0F6
 }
+fn default_terminal() -> String {
+    "alacritty".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -93,6 +98,7 @@ impl Default for Config {
             text_color: default_text_color(),
             app_tag_color: default_app_tag_color(),
             project_tag_color: default_project_tag_color(),
+            terminal: default_terminal(),
         }
     }
 }
