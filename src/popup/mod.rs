@@ -57,7 +57,7 @@ impl SuggestionItem {
 pub struct PopupState {
     pub query: String,
     pub all_items: Vec<SuggestionItem>,
-    pub filtered: Vec<SuggestionItem>,
+    pub filtered: Vec<usize>,
     pub selected: usize,
     matcher: SkimMatcherV2,
 }
@@ -73,7 +73,7 @@ impl PopupState {
             all_items.push(SuggestionItem::App(a));
         }
 
-        let filtered = all_items.clone();
+        let filtered = (0..all_items.len()).collect();
 
         PopupState {
             query: String::new(),
@@ -85,23 +85,26 @@ impl PopupState {
     }
 
     pub fn update_filter(&mut self) {
+        let start_time = std::time::Instant::now();
         if self.query.is_empty() {
-            self.filtered = self.all_items.clone();
+            self.filtered = (0..self.all_items.len()).collect();
         } else {
-            let mut matches: Vec<(i64, SuggestionItem)> = self
+            let mut matches: Vec<(i64, usize)> = self
                 .all_items
                 .iter()
-                .filter_map(|item| {
+                .enumerate()
+                .filter_map(|(idx, item)| {
                     self.matcher
                         .fuzzy_match(item.name(), &self.query)
-                        .map(|score| (score, item.clone()))
+                        .map(|score| (score, idx))
                 })
                 .collect();
             matches.sort_by(|a, b| b.0.cmp(&a.0));
-            self.filtered = matches.into_iter().map(|(_, item)| item).collect();
+            self.filtered = matches.into_iter().map(|(_, idx)| idx).collect();
         }
 
         self.selected = 0;
+        log_perf("update_filter", start_time);
     }
 }
 
@@ -140,6 +143,7 @@ fn fetch_data() -> Result<(Vec<Project>, Vec<App>), String> {
 }
 
 pub fn run() {
+    let config = crate::config::Config::load();
     let (projects, apps) = match fetch_data() {
         Ok(data) => data,
         Err(e) => {
@@ -156,16 +160,16 @@ pub fn run() {
     // Top, Right, Bottom, Left margin
     let ev: WindowState<()> = WindowState::new("aooff")
         .with_allscreens()
-        .with_size((600, 400))
+        .with_size((config.window_width, config.window_height))
         .with_layer(Layer::Top)
         .with_anchor(Anchor::Bottom | Anchor::Left)
-        .with_margin((0, 0, 20, 20))
+        .with_margin((0, 0, config.margin_bottom, config.margin_left))
         .with_keyboard_interacivity(KeyboardInteractivity::Exclusive)
         .build()
         .unwrap();
 
-    let mut width = 600;
-    let mut height = 400;
+    let mut width = config.window_width;
+    let mut height = config.window_height;
     let mut draw_file: Option<std::fs::File> = None;
 
     ev.running(move |event, _ev, _index| match event {
@@ -174,7 +178,12 @@ pub fn run() {
         LayerShellEvent::CompositorProvide(compositor, qh) => {
             for x in _ev.get_unit_iter() {
                 let region = compositor.create_region(qh, ());
-                region.add(0, 0, 600, 400);
+                region.add(
+                    0,
+                    0,
+                    config.window_width as i32,
+                    config.window_height as i32,
+                );
                 x.get_wlsurface().set_input_region(Some(&region));
             }
             ReturnData::None
@@ -189,6 +198,7 @@ pub fn run() {
                 &state,
                 &mut font_system,
                 &mut swash_cache,
+                &config,
             );
             draw_file = file.try_clone().ok();
             let pool = shm.create_pool(file.as_fd(), (width * height * 4) as i32, qh, ());
@@ -217,6 +227,7 @@ pub fn run() {
                     &state,
                     &mut font_system,
                     &mut swash_cache,
+                    &config,
                 );
                 if let Some(idx) = _index {
                     if let Some(unit) = _ev.get_unit_with_id(idx) {
@@ -233,7 +244,8 @@ pub fn run() {
                         return ReturnData::RequestExit;
                     }
                     Key::Named(NamedKey::Enter) => {
-                        if let Some(item) = state.filtered.get(state.selected) {
+                        if let Some(&idx) = state.filtered.get(state.selected) {
+                            let item = &state.all_items[idx];
                             item.execute();
                         }
                         return ReturnData::RequestExit;
@@ -312,6 +324,33 @@ fn draw_rect(pixels: &mut [u32], width: u32, x: u32, y: u32, w: u32, h: u32, col
 
 use std::io::Seek;
 
+fn log_perf(action: &str, start: std::time::Instant) {
+    let elapsed = start.elapsed();
+    let mut mem = 0;
+    if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+        if let Some(rss_pages) = statm.split_whitespace().nth(1) {
+            if let Ok(pages) = rss_pages.parse::<u64>() {
+                mem = pages * 4; // kb
+            }
+        }
+    }
+    let msg = format!(
+        "[{}] {} took {:?}, RSS: {} KB
+",
+        chrono::Local::now().to_rfc3339(),
+        action,
+        elapsed,
+        mem
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/aooff_popup_perf.log")
+    {
+        let _ = f.write_all(msg.as_bytes());
+    }
+}
+
 fn draw(
     tmp: &mut std::fs::File,
     width: u32,
@@ -319,34 +358,48 @@ fn draw(
     state: &PopupState,
     font_system: &mut FontSystem,
     swash_cache: &mut SwashCache,
+    config: &crate::config::Config,
 ) {
+    let start_time = std::time::Instant::now();
     let mut pixels = vec![0u32; (width * height) as usize];
 
     // Background: Catppuccin Macchiato Base (#24273A)
     for p in pixels.iter_mut() {
-        *p = 0xFF24273A;
+        *p = config.bg_color;
     }
 
-    let metrics = Metrics::new(16.0, 20.0);
+    let metrics = Metrics::new(config.font_size, config.line_height);
 
     let search_h = 40;
     let list_y = search_h + 10;
 
     // Draw ratatui-style Search Box
-    draw_rect(&mut pixels, width, 0, 0, width, search_h, 0xFF8BD5CA); // Cyan border
+    draw_rect(
+        &mut pixels,
+        width,
+        0,
+        0,
+        width,
+        search_h,
+        config.border_search_color,
+    ); // Cyan border
 
     let mut search_title = Buffer::new(font_system, metrics);
     search_title.set_size(font_system, Some(width as f32), Some(20.0));
     search_title.set_text(
         font_system,
         " Search ",
-        Attrs::new().color(Color::rgb(0x8B, 0xD5, 0xCA)),
+        Attrs::new().color(Color::rgb(
+            (config.border_search_color >> 16) as u8,
+            (config.border_search_color >> 8) as u8,
+            config.border_search_color as u8,
+        )),
         Shaping::Advanced,
     );
     search_title.shape_until_scroll(font_system, false);
 
     // Erase top border where title sits
-    draw_h_line(&mut pixels, width, 15, 0, 65, 0xFF24273A);
+    draw_h_line(&mut pixels, width, 15, 0, 65, config.bg_color);
     draw_buffer(
         &mut pixels,
         width,
@@ -364,7 +417,11 @@ fn draw(
     search_buffer.set_text(
         font_system,
         &state.query,
-        Attrs::new().color(Color::rgb(0xCA, 0xD3, 0xF5)),
+        Attrs::new().color(Color::rgb(
+            (config.text_color >> 16) as u8,
+            (config.text_color >> 8) as u8,
+            config.text_color as u8,
+        )),
         Shaping::Advanced,
     );
     search_buffer.shape_until_scroll(font_system, false);
@@ -381,7 +438,15 @@ fn draw(
 
     // Draw ratatui-style Results Box
     let list_h = height - list_y;
-    draw_rect(&mut pixels, width, 0, list_y, width, list_h, 0xFF5B6078); // Surface 2 border
+    draw_rect(
+        &mut pixels,
+        width,
+        0,
+        list_y,
+        width,
+        list_h,
+        config.border_list_color,
+    ); // Surface 2 border
 
     let title_str = format!(
         " Results ({}/{}) ",
@@ -393,13 +458,17 @@ fn draw(
     list_title.set_text(
         font_system,
         &title_str,
-        Attrs::new().color(Color::rgb(0x5B, 0x60, 0x78)),
+        Attrs::new().color(Color::rgb(
+            (config.border_list_color >> 16) as u8,
+            (config.border_list_color >> 8) as u8,
+            config.border_list_color as u8,
+        )),
         Shaping::Advanced,
     );
     list_title.shape_until_scroll(font_system, false);
 
     // Erase top border for list title
-    draw_h_line(&mut pixels, width, 15, list_y, 140, 0xFF24273A);
+    draw_h_line(&mut pixels, width, 15, list_y, 140, config.bg_color);
     draw_buffer(
         &mut pixels,
         width,
@@ -421,7 +490,7 @@ fn draw(
     let end_idx = (start_idx + 10).min(state.filtered.len());
 
     for i in start_idx..end_idx {
-        let item = &state.filtered[i];
+        let item = &state.all_items[state.filtered[i]];
         let is_selected = i == state.selected;
 
         if is_selected {
@@ -430,7 +499,14 @@ fn draw(
                 if hy >= height - 1 {
                     break;
                 }
-                draw_h_line(&mut pixels, width, 1, hy, width - 2, 0xFF363A4F);
+                draw_h_line(
+                    &mut pixels,
+                    width,
+                    1,
+                    hy,
+                    width - 2,
+                    config.highlight_bg_color,
+                );
             }
         }
 
@@ -438,8 +514,16 @@ fn draw(
         item_buffer.set_size(font_system, Some(width as f32 - 20.0), Some(25.0));
 
         let tag_color = match item {
-            SuggestionItem::App(_) => Color::rgb(0xA6, 0xDA, 0x95), // Green
-            SuggestionItem::Project(_) => Color::rgb(0xC6, 0xA0, 0xF6), // Mauve
+            SuggestionItem::App(_) => Color::rgb(
+                (config.app_tag_color >> 16) as u8,
+                (config.app_tag_color >> 8) as u8,
+                config.app_tag_color as u8,
+            ), // Green
+            SuggestionItem::Project(_) => Color::rgb(
+                (config.project_tag_color >> 16) as u8,
+                (config.project_tag_color >> 8) as u8,
+                config.project_tag_color as u8,
+            ), // Mauve
         };
 
         item_buffer.set_rich_text(
@@ -453,7 +537,11 @@ fn draw(
                 ),
                 (
                     item.name(),
-                    Attrs::new().color(Color::rgb(0xCA, 0xD3, 0xF5)),
+                    Attrs::new().color(Color::rgb(
+                        (config.text_color >> 16) as u8,
+                        (config.text_color >> 8) as u8,
+                        config.text_color as u8,
+                    )),
                 ),
             ],
             Attrs::new(),
@@ -479,6 +567,7 @@ fn draw(
     tmp.seek(std::io::SeekFrom::Start(0)).unwrap();
     tmp.write_all(bytes).unwrap();
     tmp.flush().unwrap();
+    log_perf("draw", start_time);
 }
 
 fn draw_buffer(

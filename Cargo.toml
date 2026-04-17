@@ -30,6 +30,8 @@ softbuffer = "0.4.6"
 cosmic-text = "0.12.1"
 tiny-skia = "0.11.4"
 winit = "0.31.0-beta.2"
+toml = "1.1.2"
+chrono = "0.4.44"
 
 [profile.release]
 opt-level = 3
