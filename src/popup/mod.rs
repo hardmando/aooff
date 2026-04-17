@@ -18,6 +18,8 @@ use winit::keyboard::{Key, NamedKey};
 pub enum SuggestionItem {
     App(App),
     Project(Project),
+    File(String),
+    Directory(String),
 }
 
 impl SuggestionItem {
@@ -25,6 +27,8 @@ impl SuggestionItem {
         match self {
             SuggestionItem::App(a) => &a.name,
             SuggestionItem::Project(p) => &p.name,
+            SuggestionItem::File(f) => f,
+            SuggestionItem::Directory(d) => d,
         }
     }
 
@@ -32,6 +36,8 @@ impl SuggestionItem {
         match self {
             SuggestionItem::App(_) => "App",
             SuggestionItem::Project(_) => "Project",
+            SuggestionItem::File(_) => "File",
+            SuggestionItem::Directory(_) => "Dir",
         }
     }
 
@@ -50,12 +56,23 @@ impl SuggestionItem {
                     ))
                     .spawn();
             }
+            SuggestionItem::File(f) => {
+                let _ = Command::new("xdg-open").arg(f).spawn();
+            }
+            SuggestionItem::Directory(d) => {
+                let _ = Command::new("kitty")
+                    .arg("--working-directory")
+                    .arg(d)
+                    .spawn();
+            }
         }
     }
 }
 
+
 pub struct PopupState {
     pub query: String,
+    pub file_rx: Option<std::sync::mpsc::Receiver<SuggestionItem>>,
     pub all_items: Vec<SuggestionItem>,
     pub filtered: Vec<usize>,
     pub selected: usize,
@@ -77,6 +94,7 @@ impl PopupState {
 
         PopupState {
             query: String::new(),
+            file_rx: Some(spawn_file_scanner()),
             all_items,
             filtered,
             selected: 0,
@@ -86,6 +104,11 @@ impl PopupState {
 
     pub fn update_filter(&mut self) {
         let start_time = std::time::Instant::now();
+        if let Some(rx) = &self.file_rx {
+            while let Ok(item) = rx.try_recv() {
+                self.all_items.push(item);
+            }
+        }
         if self.query.is_empty() {
             self.filtered = (0..self.all_items.len()).collect();
         } else {
@@ -405,7 +428,7 @@ fn draw(
         width,
         height,
         15,
-        -10,
+        -12,
         &search_title,
         font_system,
         swash_cache,
@@ -474,7 +497,7 @@ fn draw(
         width,
         height,
         15,
-        list_y as i32 - 10,
+        list_y as i32 - 12,
         &list_title,
         font_system,
         swash_cache,
@@ -519,11 +542,13 @@ fn draw(
                 (config.app_tag_color >> 8) as u8,
                 config.app_tag_color as u8,
             ), // Green
-            SuggestionItem::Project(_) => Color::rgb(
-                (config.project_tag_color >> 16) as u8,
-                (config.project_tag_color >> 8) as u8,
-                config.project_tag_color as u8,
-            ), // Mauve
+            SuggestionItem::Project(_) | SuggestionItem::File(_) | SuggestionItem::Directory(_) => {
+                Color::rgb(
+                    (config.project_tag_color >> 16) as u8,
+                    (config.project_tag_color >> 8) as u8,
+                    config.project_tag_color as u8,
+                )
+            } // Mauve
         };
 
         item_buffer.set_rich_text(
@@ -603,4 +628,35 @@ fn draw_buffer(
             }
         },
     );
+}
+
+use std::sync::mpsc::{Receiver, channel};
+use std::thread;
+
+pub fn spawn_file_scanner() -> Receiver<SuggestionItem> {
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
+        let walker = walkdir::WalkDir::new(&home)
+            .max_depth(4)
+            .into_iter()
+            .filter_entry(|e| {
+                let s = e.file_name().to_string_lossy();
+                !s.starts_with('.') && s != "node_modules" && s != "target"
+            });
+
+        for entry in walker.filter_map(|e| e.ok()) {
+            let path = entry.path().to_string_lossy().to_string();
+            if entry.file_type().is_dir() {
+                if tx.send(SuggestionItem::Directory(path)).is_err() {
+                    break;
+                }
+            } else if entry.file_type().is_file() {
+                if tx.send(SuggestionItem::File(path)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    rx
 }
