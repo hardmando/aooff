@@ -51,13 +51,8 @@ pub fn scan_apps(apps: &mut Vec<App>) -> Result<(), String> {
 
                     if path.is_file() {
                         apps.push(App {
-                            name: path
-                                .file_name()
-                                .unwrap()
-                                .to_string_lossy()
-                                .into_owned()
-                                .into_boxed_str(),
-                            path: path.to_string_lossy().into_owned().into_boxed_str(),
+                            name: path.file_name().unwrap().to_string_lossy().into(),
+                            path: path.to_string_lossy().into(),
                         });
                     }
                 }

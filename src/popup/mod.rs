@@ -1,13 +1,17 @@
-mod ui;
-
 use crate::protocol::{App, Project, Request, Response};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::ExecutableCommand;
-use ratatui::prelude::*;
+use fuzzy_matcher::FuzzyMatcher;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use rkyv::util::AlignedVec;
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::process::Command;
+
+use cosmic_text::{Attrs, Buffer, Color, FontSystem, Metrics, Shaping, SwashCache};
+use layershellev::reexport::*;
+use layershellev::*;
+use winit::event::ElementState;
+use winit::keyboard::{Key, NamedKey};
 
 /// Item in the suggestion list — either an App or a Project.
 #[derive(Clone)]
@@ -30,6 +34,24 @@ impl SuggestionItem {
             SuggestionItem::Project(_) => "Project",
         }
     }
+
+    pub fn execute(&self) {
+        match self {
+            SuggestionItem::App(a) => {
+                let _ = Command::new(&*a.path).spawn();
+            }
+            SuggestionItem::Project(p) => {
+                let path = p.path.to_string();
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!(
+                        "kitty -e tmux new-session sh -c \"cd '{}' && tdl c\"",
+                        path
+                    ))
+                    .spawn();
+            }
+        }
+    }
 }
 
 pub struct PopupState {
@@ -37,7 +59,7 @@ pub struct PopupState {
     pub all_items: Vec<SuggestionItem>,
     pub filtered: Vec<SuggestionItem>,
     pub selected: usize,
-    pub should_quit: bool,
+    matcher: SkimMatcherV2,
 }
 
 impl PopupState {
@@ -58,30 +80,28 @@ impl PopupState {
             all_items,
             filtered,
             selected: 0,
-            should_quit: false,
+            matcher: SkimMatcherV2::default(),
         }
     }
 
     pub fn update_filter(&mut self) {
-        let q = self.query.to_lowercase();
-
-        if q.is_empty() {
+        if self.query.is_empty() {
             self.filtered = self.all_items.clone();
         } else {
-            self.filtered = self
+            let mut matches: Vec<(i64, SuggestionItem)> = self
                 .all_items
                 .iter()
-                .filter(|item| item.name().to_lowercase().contains(&q))
-                .cloned()
+                .filter_map(|item| {
+                    self.matcher
+                        .fuzzy_match(item.name(), &self.query)
+                        .map(|score| (score, item.clone()))
+                })
                 .collect();
+            matches.sort_by(|a, b| b.0.cmp(&a.0));
+            self.filtered = matches.into_iter().map(|(_, item)| item).collect();
         }
 
-        // Keep selected in bounds
-        if self.filtered.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.filtered.len() {
-            self.selected = self.filtered.len() - 1;
-        }
+        self.selected = 0;
     }
 }
 
@@ -90,7 +110,6 @@ fn fetch_data() -> Result<(Vec<Project>, Vec<App>), String> {
     let mut stream =
         UnixStream::connect("/tmp/aooff.sock").map_err(|e| format!("Connect failed: {}", e))?;
 
-    // Serialize and send the GetAll request
     let request_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&Request::GetAll)
         .map_err(|e| format!("Serialize failed: {}", e))?;
 
@@ -98,12 +117,10 @@ fn fetch_data() -> Result<(Vec<Project>, Vec<App>), String> {
         .write_all(&request_bytes)
         .map_err(|e| format!("Write failed: {}", e))?;
 
-    // Shutdown write side so the server gets EOF
     stream
         .shutdown(std::net::Shutdown::Write)
         .map_err(|e| format!("Shutdown failed: {}", e))?;
 
-    // Read response
     let mut buffer = Vec::new();
     stream
         .read_to_end(&mut buffer)
@@ -123,93 +140,378 @@ fn fetch_data() -> Result<(Vec<Project>, Vec<App>), String> {
 }
 
 pub fn run() {
-    // Fetch data from daemon
-    let start = std::time::Instant::now();
     let (projects, apps) = match fetch_data() {
         Ok(data) => data,
         Err(e) => {
             eprintln!("Failed to connect to daemon: {}", e);
-            eprintln!("Make sure the daemon is running (aooff)");
             std::process::exit(1);
         }
     };
-    let elapsed = start.elapsed();
-    // Write timing to file (stderr is taken over by the TUI)
-    let _ = std::fs::write(
-        "/tmp/aooff_popup_timing.txt",
-        format!(
-            "IPC fetch: {} projects + {} apps in {:.2?}",
-            projects.len(),
-            apps.len(),
-            elapsed
-        ),
-    );
 
     let mut state = PopupState::new(projects, apps);
 
-    // Setup terminal
-    terminal::enable_raw_mode().expect("Failed to enable raw mode");
-    let mut stdout = io::stdout();
-    stdout
-        .execute(EnterAlternateScreen)
-        .expect("Failed to enter alternate screen");
+    let mut font_system = FontSystem::new();
+    let mut swash_cache = SwashCache::new();
 
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).expect("Failed to create terminal");
+    // Top, Right, Bottom, Left margin
+    let ev: WindowState<()> = WindowState::new("aooff")
+        .with_allscreens()
+        .with_size((600, 400))
+        .with_layer(Layer::Top)
+        .with_anchor(Anchor::Bottom | Anchor::Left)
+        .with_margin((0, 0, 20, 20))
+        .with_keyboard_interacivity(KeyboardInteractivity::Exclusive)
+        .build()
+        .unwrap();
 
-    // Event loop
-    loop {
-        terminal
-            .draw(|f| ui::draw(f, &state))
-            .expect("Failed to draw");
+    let mut width = 600;
+    let mut height = 400;
+    let mut draw_file: Option<std::fs::File> = None;
 
-        if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+    ev.running(move |event, _ev, _index| match event {
+        LayerShellEvent::InitRequest => ReturnData::RequestBind,
+        LayerShellEvent::BindProvide(_globals, _qh) => ReturnData::RequestCompositor,
+        LayerShellEvent::CompositorProvide(compositor, qh) => {
+            for x in _ev.get_unit_iter() {
+                let region = compositor.create_region(qh, ());
+                region.add(0, 0, 600, 400);
+                x.get_wlsurface().set_input_region(Some(&region));
+            }
+            ReturnData::None
+        }
+        LayerShellEvent::RequestBuffer(file, shm, qh, init_w, init_h) => {
+            width = init_w;
+            height = init_h;
+            draw(
+                file,
+                width,
+                height,
+                &state,
+                &mut font_system,
+                &mut swash_cache,
+            );
+            draw_file = file.try_clone().ok();
+            let pool = shm.create_pool(file.as_fd(), (width * height * 4) as i32, qh, ());
+            ReturnData::WlBuffer(pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                (width * 4) as i32,
+                wl_shm::Format::Argb8888,
+                qh,
+                (),
+            ))
+        }
+        LayerShellEvent::RequestMessages(DispatchMessage::RequestRefresh {
+            width: w,
+            height: h,
+            ..
+        }) => {
+            width = *w;
+            height = *h;
+            if let Some(file) = draw_file.as_mut() {
+                draw(
+                    file,
+                    width,
+                    height,
+                    &state,
+                    &mut font_system,
+                    &mut swash_cache,
+                );
+                if let Some(idx) = _index {
+                    if let Some(unit) = _ev.get_unit_with_id(idx) {
+                        unit.refresh();
+                    }
                 }
-
-                match key.code {
-                    KeyCode::Esc => {
-                        state.should_quit = true;
+            }
+            ReturnData::None
+        }
+        LayerShellEvent::RequestMessages(DispatchMessage::KeyboardInput { event, .. }) => {
+            if event.state == ElementState::Pressed {
+                match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        return ReturnData::RequestExit;
                     }
-                    KeyCode::Backspace => {
-                        state.query.pop();
-                        state.update_filter();
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(item) = state.filtered.get(state.selected) {
+                            item.execute();
+                        }
+                        return ReturnData::RequestExit;
                     }
-                    KeyCode::Up => {
+                    Key::Named(NamedKey::Backspace) => {
+                        if !state.query.is_empty() {
+                            state.query.pop();
+                            state.update_filter();
+                            _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+                            return ReturnData::None;
+                        }
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
                         if state.selected > 0 {
                             state.selected -= 1;
+                            _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+                            return ReturnData::None;
                         }
                     }
-                    KeyCode::Down => {
-                        if !state.filtered.is_empty()
-                            && state.selected < state.filtered.len() - 1
-                        {
+                    Key::Named(NamedKey::ArrowDown) => {
+                        if state.selected < state.filtered.len().saturating_sub(1) {
                             state.selected += 1;
+                            _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+                            return ReturnData::None;
                         }
                     }
-                    KeyCode::Enter => {
-                        // For now, just quit — action handling can be added later
-                        state.should_quit = true;
-                    }
-                    KeyCode::Char(c) => {
-                        state.query.push(c);
+                    Key::Character(c) if c == " " => {
+                        state.query.push(' ');
                         state.update_filter();
+                        _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+                        return ReturnData::None;
+                    }
+                    Key::Character(c) => {
+                        if !c.chars().next().map_or(false, |ch| ch.is_control()) {
+                            state.query.push_str(c.as_str());
+                            state.update_filter();
+                            _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+                            return ReturnData::None;
+                        }
                     }
                     _ => {}
                 }
             }
+            _ev.request_refresh_all(layershellev::RefreshRequest::NextFrame);
+            ReturnData::None
         }
+        _ => ReturnData::None,
+    })
+    .unwrap();
+}
 
-        if state.should_quit {
-            break;
+fn draw_h_line(pixels: &mut [u32], width: u32, x: u32, y: u32, len: u32, color: u32) {
+    for i in x..(x + len).min(width) {
+        let idx = (y * width + i) as usize;
+        if idx < pixels.len() {
+            pixels[idx] = color;
         }
     }
+}
 
-    // Restore terminal
-    terminal::disable_raw_mode().expect("Failed to disable raw mode");
-    io::stdout()
-        .execute(LeaveAlternateScreen)
-        .expect("Failed to leave alternate screen");
+fn draw_v_line(pixels: &mut [u32], width: u32, x: u32, y: u32, len: u32, color: u32) {
+    for i in y..(y + len) {
+        let idx = (i * width + x) as usize;
+        if idx < pixels.len() {
+            pixels[idx] = color;
+        }
+    }
+}
+
+fn draw_rect(pixels: &mut [u32], width: u32, x: u32, y: u32, w: u32, h: u32, color: u32) {
+    draw_h_line(pixels, width, x, y, w, color);
+    draw_h_line(pixels, width, x, y + h - 1, w, color);
+    draw_v_line(pixels, width, x, y, h, color);
+    draw_v_line(pixels, width, x + w - 1, y, h, color);
+}
+
+use std::io::Seek;
+
+fn draw(
+    tmp: &mut std::fs::File,
+    width: u32,
+    height: u32,
+    state: &PopupState,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+) {
+    let mut pixels = vec![0u32; (width * height) as usize];
+
+    // Background: Catppuccin Macchiato Base (#24273A)
+    for p in pixels.iter_mut() {
+        *p = 0xFF24273A;
+    }
+
+    let metrics = Metrics::new(16.0, 20.0);
+
+    let search_h = 40;
+    let list_y = search_h + 10;
+
+    // Draw ratatui-style Search Box
+    draw_rect(&mut pixels, width, 0, 0, width, search_h, 0xFF8BD5CA); // Cyan border
+
+    let mut search_title = Buffer::new(font_system, metrics);
+    search_title.set_size(font_system, Some(width as f32), Some(20.0));
+    search_title.set_text(
+        font_system,
+        " Search ",
+        Attrs::new().color(Color::rgb(0x8B, 0xD5, 0xCA)),
+        Shaping::Advanced,
+    );
+    search_title.shape_until_scroll(font_system, false);
+
+    // Erase top border where title sits
+    draw_h_line(&mut pixels, width, 15, 0, 65, 0xFF24273A);
+    draw_buffer(
+        &mut pixels,
+        width,
+        height,
+        15,
+        -10,
+        &search_title,
+        font_system,
+        swash_cache,
+    );
+
+    // Draw query
+    let mut search_buffer = Buffer::new(font_system, metrics);
+    search_buffer.set_size(font_system, Some(width as f32 - 20.0), Some(30.0));
+    search_buffer.set_text(
+        font_system,
+        &state.query,
+        Attrs::new().color(Color::rgb(0xCA, 0xD3, 0xF5)),
+        Shaping::Advanced,
+    );
+    search_buffer.shape_until_scroll(font_system, false);
+    draw_buffer(
+        &mut pixels,
+        width,
+        height,
+        10,
+        10,
+        &search_buffer,
+        font_system,
+        swash_cache,
+    );
+
+    // Draw ratatui-style Results Box
+    let list_h = height - list_y;
+    draw_rect(&mut pixels, width, 0, list_y, width, list_h, 0xFF5B6078); // Surface 2 border
+
+    let title_str = format!(
+        " Results ({}/{}) ",
+        state.filtered.len(),
+        state.all_items.len()
+    );
+    let mut list_title = Buffer::new(font_system, metrics);
+    list_title.set_size(font_system, Some(width as f32), Some(20.0));
+    list_title.set_text(
+        font_system,
+        &title_str,
+        Attrs::new().color(Color::rgb(0x5B, 0x60, 0x78)),
+        Shaping::Advanced,
+    );
+    list_title.shape_until_scroll(font_system, false);
+
+    // Erase top border for list title
+    draw_h_line(&mut pixels, width, 15, list_y, 140, 0xFF24273A);
+    draw_buffer(
+        &mut pixels,
+        width,
+        height,
+        15,
+        list_y as i32 - 10,
+        &list_title,
+        font_system,
+        swash_cache,
+    );
+
+    // Draw list
+    let mut y = list_y + 10;
+    let start_idx = if state.selected >= 10 {
+        state.selected - 9
+    } else {
+        0
+    };
+    let end_idx = (start_idx + 10).min(state.filtered.len());
+
+    for i in start_idx..end_idx {
+        let item = &state.filtered[i];
+        let is_selected = i == state.selected;
+
+        if is_selected {
+            // Highlight background (#363A4F Surface 0)
+            for hy in y..y + 25 {
+                if hy >= height - 1 {
+                    break;
+                }
+                draw_h_line(&mut pixels, width, 1, hy, width - 2, 0xFF363A4F);
+            }
+        }
+
+        let mut item_buffer = Buffer::new(font_system, metrics);
+        item_buffer.set_size(font_system, Some(width as f32 - 20.0), Some(25.0));
+
+        let tag_color = match item {
+            SuggestionItem::App(_) => Color::rgb(0xA6, 0xDA, 0x95), // Green
+            SuggestionItem::Project(_) => Color::rgb(0xC6, 0xA0, 0xF6), // Mauve
+        };
+
+        item_buffer.set_rich_text(
+            font_system,
+            vec![
+                (
+                    format!("[{}] ", item.tag()).as_str(),
+                    Attrs::new()
+                        .color(tag_color)
+                        .weight(cosmic_text::Weight::BOLD),
+                ),
+                (
+                    item.name(),
+                    Attrs::new().color(Color::rgb(0xCA, 0xD3, 0xF5)),
+                ),
+            ],
+            Attrs::new(),
+            Shaping::Advanced,
+        );
+        item_buffer.shape_until_scroll(font_system, false);
+
+        draw_buffer(
+            &mut pixels,
+            width,
+            height,
+            10,
+            y as i32 + 2,
+            &item_buffer,
+            font_system,
+            swash_cache,
+        );
+        y += 25;
+    }
+
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4) };
+    tmp.seek(std::io::SeekFrom::Start(0)).unwrap();
+    tmp.write_all(bytes).unwrap();
+    tmp.flush().unwrap();
+}
+
+fn draw_buffer(
+    pixels: &mut [u32],
+    width: u32,
+    height: u32,
+    x_offset: i32,
+    y_offset: i32,
+    buffer: &Buffer,
+    font_system: &mut FontSystem,
+    swash_cache: &mut SwashCache,
+) {
+    buffer.draw(
+        font_system,
+        swash_cache,
+        Color::rgb(255, 255, 255),
+        |x, y, _w, _h, color| {
+            let px = x + x_offset;
+            let py = y + y_offset;
+            if px >= 0 && px < width as i32 && py >= 0 && py < height as i32 {
+                let idx = (py as u32 * width + px as u32) as usize;
+                let a = color.a() as f32 / 255.0;
+                let bg = pixels[idx];
+                let bg_r = ((bg >> 16) & 0xFF) as f32;
+                let bg_g = ((bg >> 8) & 0xFF) as f32;
+                let bg_b = (bg & 0xFF) as f32;
+
+                let r = (color.r() as f32 * a + bg_r * (1.0 - a)) as u32;
+                let g = (color.g() as f32 * a + bg_g * (1.0 - a)) as u32;
+                let b = (color.b() as f32 * a + bg_b * (1.0 - a)) as u32;
+
+                pixels[idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+            }
+        },
+    );
 }

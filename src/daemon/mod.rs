@@ -12,12 +12,7 @@ use std::thread;
 const ESTIMATED_PROJECTS: usize = 50;
 const ESTIMATED_APPS: usize = 3000;
 
-pub fn start_daemon(
-    home: String,
-) -> (
-    Arc<ArcSwap<Vec<Project>>>,
-    Arc<ArcSwap<Vec<App>>>,
-) {
+pub fn start_daemon(home: String) -> (Arc<ArcSwap<Vec<Project>>>, Arc<ArcSwap<Vec<App>>>) {
     let projects = Arc::new(ArcSwap::from_pointee(Vec::new()));
     let apps = Arc::new(ArcSwap::from_pointee(Vec::new()));
 
@@ -103,13 +98,14 @@ fn do_scan_apps(store: &Arc<ArcSwap<Vec<App>>>) {
     store.store(Arc::new(new_apps));
 }
 
-fn start_ipc_server(
-    projects: Arc<ArcSwap<Vec<Project>>>,
-    apps: Arc<ArcSwap<Vec<App>>>,
-) {
+fn start_ipc_server(projects: Arc<ArcSwap<Vec<Project>>>, apps: Arc<ArcSwap<Vec<App>>>) {
     let socket_path = "/tmp/aooff.sock";
 
-    let _ = std::fs::remove_file(socket_path);
+    if Path::new(socket_path).exists() {
+        if let Err(e) = std::fs::remove_file(socket_path) {
+            eprintln!("Failed to remove old IPC socket: {}", e);
+        }
+    }
 
     let listener = match UnixListener::bind(socket_path) {
         Ok(l) => l,
